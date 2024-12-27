@@ -1,148 +1,172 @@
 const std = @import("std");
-const print = std.debug.print;
 const assert = std.debug.assert;
+const print = std.debug.print;
 
-var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-const alloc = gpa.allocator();
+var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+const alloc = arena.allocator();
 
 pub fn main() !void {
+    defer arena.deinit();
+
     const file = try std.fs.cwd().openFile("./src/task.input", .{});
     defer file.close();
+
     const _reader = file.reader();
     var reader = std.io.bufferedReader(_reader);
 
-    var buf: [100 * 1000]u8 = undefined;
-    const read_bytes = try reader.read(&buf);
-    const text: []const u8 = buf[0..read_bytes];
+    var buf: [100000]u8 = undefined;
+    const read = try reader.read(&buf);
+    const text = buf[0..read];
 
-    const rules_and_updates = try parse_rules_and_updates(text);
-    const rules_per_page_num = try parse_rules_per_page_num(&rules_and_updates);
-    _ = rules_per_page_num;
-    for (rules_and_updates.rules) |rule| {
-        print("{d}|{d}\n", .{rule.before, rule.after});
+    var text_iter = std.mem.splitSequence(u8, text, "\n\n");
+    const text_rules = text_iter.next().?;
+    const text_updates = text_iter.next().?;
+    assert(text_iter.next() == null);
+
+    // print("rules_text: \n{s}\n\n", .{text_rules});
+    // print("updates_text: \n{s}\n\n", .{text_updates});
+
+    const rules = blk: {
+        var rules_iter = std.mem.splitSequence(u8, text_rules, "\n");
+        var rules_buf: [10000]Rule = undefined;
+        var rules_count: u32 = 0;
+        while (rules_iter.next()) |r| : (rules_count += 1) {
+            var r_iter = std.mem.splitSequence(u8, r, "|");
+            const b = r_iter.next().?;
+            const a = r_iter.next().?;
+            assert(r_iter.next() == null);
+            rules_buf[rules_count] = Rule{
+                .before = try std.fmt.parseInt(u32, b, 10),
+                .after = try std.fmt.parseInt(u32, a, 10),
+            };
+        }
+        const rules = rules_buf[0..rules_count];
+        break :blk rules;
+    };
+
+    const updates = blk: {
+        var updates_iter = std.mem.splitSequence(u8, text_updates, "\n");
+        var updates_buf: [10000]Update = undefined;
+        var updates_count: u32 = 0;
+        while (updates_iter.next()) |u| {
+            if (std.mem.eql(u8, u, "")) continue;
+
+            var page_iter = std.mem.splitSequence(u8, u, ",");
+            var pages = NumList.init(alloc);
+            while (page_iter.next()) |p| {
+                const page = try std.fmt.parseInt(u32, p, 10);
+                try pages.append(page);
+            }
+            updates_buf[updates_count] = Update{ .pages = try pages.toOwnedSlice() };
+            updates_count += 1;
+        }
+        const updates = updates_buf[0..updates_count];
+        break :blk updates;
+    };
+
+    const rules_map = try build_rules_map(rules);
+    print_rules_map(&rules_map);
+    print_updates(updates);
+
+    const valid_update_sum = try sum_valid_updates(updates, &rules_map);
+    print("valid update sum: {d}\n", .{valid_update_sum});
+}
+
+fn sum_valid_updates(updates: []const Update, rules_map: *const RulesMap) !u32 {
+    var sum: u32 = 0;
+    for (updates) |u| {
+        var is_valid = true;
+        var seen = std.AutoHashMap(u32, void).init(alloc);
+        page_loop: for (u.pages) |p| {
+            try seen.put(p, {});
+            const p_rules = rules_map.getPtr(p) orelse continue;
+            // if seen and p_rules.after have overlap, then is_valid = false
+            if (p_rules.after.items.len == 0) continue;
+            for (p_rules.after.items) |p_after| {
+                if (seen.contains(p_after)) {
+                    is_valid = false;
+                    break :page_loop;
+                }
+            }
+        }
+
+        if (is_valid) sum += middle_page(u.pages);
     }
-    for (rules_and_updates.updates) |update| {
-        for (0..update.page_count) |page_idx| {
-            print("{d} ", .{update.pages[page_idx]});
+    return sum;
+}
+
+fn middle_page(pages: []const u32) u32 {
+    const pages_len: f64 = @floatFromInt(pages.len);
+    const div = @divExact(pages_len, 2.0);
+    const floor = @floor(div);
+    const idx: usize = @intFromFloat(floor);
+    return pages[idx];
+}
+
+fn build_rules_map(rules: []const Rule) !RulesMap {
+    var map = RulesMap.init(alloc);
+    for (rules) |r| {
+        if (!map.contains(r.before)) try map.put(r.before, try PerNumRules.init(alloc));
+        if (!map.contains(r.after)) try map.put(r.after, try PerNumRules.init(alloc));
+        var before_entry = map.getPtr(r.before).?;
+        try before_entry.after.append(r.after);
+        var after_entry = map.getPtr(r.after).?;
+        try after_entry.before.append(r.before);
+    }
+    return map;
+}
+
+fn print_updates(updates: []const Update) void {
+    for (updates, 0..updates.len) |u, idx| {
+        print("update {d}:", .{idx});
+        for (u.pages) |p| {
+            print(" {d}", .{p});
         }
         print("\n", .{});
     }
+    print("\n", .{});
 }
 
-const RulesForNum = struct {
-    const List = std.ArrayList(u32);
+fn print_rules_map(rules_map: *const RulesMap) void {
+    var rules_map_iter = rules_map.iterator();
+    while (rules_map_iter.next()) |entry| {
+        print("rule for num {d}: \n", .{entry.key_ptr.*});
+        print("before:", .{});
+        for (entry.value_ptr.*.before.items) |b| {
+            print(" {d}", .{b});
+        }
+        print("\n", .{});
+        print("after:", .{});
+        for (entry.value_ptr.*.after.items) |a| {
+            print(" {d}", .{a});
+        }
+        print("\n\n", .{});
+    }
+}
+
+
+const RulesMap = std.AutoHashMap(u32, PerNumRules);
+const NumList = std.ArrayList(u32);
+
+const PerNumRules = struct {
+    before: NumList,
+    after: NumList,
+
     const Self = @This();
 
-    before: List,
-    after:  List,
-
-
-    fn init(self: *Self, allocator: std.mem.Allocator) void {
-        self.before = List.init(allocator);
-        self.after = List.init(allocator);
+    fn init(allocator: std.mem.Allocator) anyerror!Self {
+        return Self{
+            .before = NumList.init(allocator),
+            .after = NumList.init(allocator),
+        };
     }
 
-    fn deinit(self: *RulesForNum) void {
+    fn deinit(self: *Self) void {
         self.before.deinit();
         self.after.deinit();
     }
 };
 
-fn parse_rules_per_page_num(p: *const UParser()) !std.AutoHashMap(u32, RulesForNum) {
-    var res = std.AutoHashMap(u32, RulesForNum).init(alloc);
-    for (p.rules) |rule| {
-        const before = try res.getOrPut(rule.before);
-        const after = try res.getOrPut(rule.after);
-        before.value_ptr.*.init(alloc);
-        after.value_ptr.*.init(alloc);
-    }
-    return res;
-}
-
-fn parse_rules_and_updates(text: []const u8) !UParser() {
-    var parsed: ParserDefault() = undefined;
-    var text_iter = std.mem.splitSequence(u8, text, "\n\n");
-    const rules_text = text_iter.next().?;
-    const updates_text = text_iter.next().?;
-
-    assert(text_iter.next() == null);
-
-    parsed.rules_count   = try parse_rules(&parsed.rules, rules_text);
-    parsed.updates_count = try parse_updates(&parsed.updates, updates_text);
-    const uparser: UParser() = .{
-        .rules   = parsed.rules[0..parsed.rules_count],
-        .updates = parsed.updates[0..parsed.updates_count],
-    };
-    return uparser;
-}
-
-fn parse_rules(dest: [*]Rule, text: []const u8) !u32 {
-    var line_iter = std.mem.splitSequence(u8, text, "\n");
-    var rule_idx: u32 = 0;
-    while (line_iter.next()) |line| {
-        if (std.mem.eql(u8, line, "")) continue;
-        var rule_iter = std.mem.splitSequence(u8, line, "|");
-        dest[rule_idx] = Rule{
-            .before = try std.fmt.parseInt(u32, rule_iter.next().?, 10),
-            .after  = try std.fmt.parseInt(u32, rule_iter.next().?, 10),
-        };
-        assert(rule_iter.next() == null);
-        rule_idx += 1;
-    }
-    return rule_idx;
-}
-
-fn parse_updates(dest: [*]DefaultUpdate(), text: []const u8) !u32 {
-    var line_iter = std.mem.splitSequence(u8, text, "\n");
-    var update_idx: u32 = 0;
-    while (line_iter.next()) |line| {
-        if (std.mem.eql(u8, line, "")) continue;
-        var page_iter = std.mem.splitSequence(u8, line, ",");
-        var page_buf: [DEFAULT_PAGE_BUF_SIZE]u32 = undefined;
-        var page_count: u32 = 0;
-        while (page_iter.next()) |page_num| {
-            page_buf[page_count] = try std.fmt.parseInt(u32, page_num, 10);
-            page_count += 1;
-        }
-        @memcpy(&dest[update_idx].pages, &page_buf);
-        dest[update_idx].page_count = page_count;
-        update_idx += 1;
-    }
-    return update_idx;
-}
-
-const DEFAULT_PAGE_BUF_SIZE = 25;
-
-fn ParserDefault() type {
-    return Parsed(1200, DEFAULT_PAGE_BUF_SIZE);
-}
-
-fn Parsed(comptime buf_size: u32, comptime page_buf_size: u32) type {
-    return struct {
-        rules:         [buf_size]Rule,
-        updates:       [buf_size]Update(page_buf_size),
-        rules_count:   u32 = 0,
-        updates_count: u32 = 0,
-    };
-}
-
-fn UParser() type {
-    return struct {
-        rules:   []Rule,
-        updates: []Update(DEFAULT_PAGE_BUF_SIZE),
-    };
-}
-
-
 const Rule = struct { before: u32, after: u32 };
 
-fn DefaultUpdate() type {
-    return Update(DEFAULT_PAGE_BUF_SIZE);
-}
-
-fn Update(comptime buf_size: u32) type {
-    return struct {
-        pages: [buf_size]u32,
-        page_count: u32,
-    };
-}
+const Update = struct { pages: []u32 };
